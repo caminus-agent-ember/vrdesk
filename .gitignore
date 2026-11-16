@@ -1,0 +1,6 @@
+quest/build/
+bin/vrdesk-bridge
+logs/
+tmp/
+*.o
+*.so

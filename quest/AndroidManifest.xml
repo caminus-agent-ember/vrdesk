@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.caminus.vrdesk"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- OpenXR: Quest requires the headset feature declaration -->
+    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <application
+        android:label="vrdesk"
+        android:hasCode="true"
+        android:allowBackup="false">
+
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|quest3|questpro" />
+        <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <meta-data android:name="com.samsung.android.vr.application.mode" android:value="vr_only" />
+
+        <!-- NativeActivity, not a plain Activity: the real work is android_main() in
+             libvrdesk_xr.so, reached through android_native_app_glue, which the framework
+             only calls for NativeActivity. A plain Activity launches, draws an empty 2D
+             panel and never touches OpenXR.
+             lib_name MUST be a child of <activity>: NativeActivity reads it from its own
+             meta-data, and falls back to a library called "main" if it is on <application>
+             (observed: "Unable to find native library main"). -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:excludeFromRecents="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode">
+            <meta-data android:name="android.app.lib_name" android:value="vrdesk_xr" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.VR" />
+            </intent-filter>
+            <!-- NOTE: do NOT add a second MAIN intent-filter here (e.g. a LAUNCHER+2D one).
+                 Two MAIN filters on one activity make the shell's library entry ambiguous:
+                 Horizon OS then starts it with cat=[android.intent.category.INFO] and cancels
+                 it (ActivityTaskManager "result code=3" = START_CANCELED), so tapping the app
+                 in the headset library did nothing. One MAIN+LAUNCHER+VR filter is the
+                 documented Quest VR entry point and launches correctly. -->
+        </activity>
+    </application>
+</manifest>
