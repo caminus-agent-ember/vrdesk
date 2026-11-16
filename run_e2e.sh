@@ -187,11 +187,22 @@ echo "active output before click: $BEFORE"
 # the frame captured right after the window maps can still be uniform, so a 2-frame
 # sample made the "frame is blank" check flaky. The client keeps the LAST frame per
 # output, so a longer window of frames converges on painted content.
-timeout 30 python3 -u tools/vrclient.py --port "$PORT" --frames 8 --timeout 10 \
+timeout 30 python3 -u tools/vrclient.py --port "$PORT" --frames 8 --timeout 10 --stats \
   --save tmp/client-frame --save-output "$OID" --click "$OID:$NX:$NY" > tmp/client.log 2>&1
 CEXIT=$?
 cat tmp/client.log
 if [ $CEXIT -eq 0 ]; then pass "client received frames from the bridge"; else fail "client failed (exit $CEXIT)"; fi
+
+# Compression: the bridge deflates each frame (flags bit0) and the client inflates it back to
+# exactly stride*height bytes. The client counts both, so assert on what actually crossed the wire.
+STATS=$(grep '^CLIENT STATS' tmp/client.log | tail -1)
+echo "$STATS"
+ZF=$(echo "$STATS" | sed -n 's/.* zlib_frames=\([0-9]*\).*/\1/p')
+IE=$(echo "$STATS" | sed -n 's/.* inflate_errors=\([0-9]*\).*/\1/p')
+RATIO=$(echo "$STATS" | sed -n 's/.* ratio=\([0-9.]*\).*/\1/p')
+if [ "${ZF:-0}" -gt 0 ]; then pass "frames arrived zlib-compressed ($ZF frames)"; else fail "no zlib frames on the wire (zf=$ZF)"; fi
+if [ "${IE:-1}" -eq 0 ]; then pass "every frame inflated to the exact raw size (0 errors)"; else fail "inflate errors=$IE"; fi
+if awk "BEGIN{exit !(${RATIO:-0} >= 2.0)}"; then pass "compression ratio ${RATIO}x (>= 2x)"; else fail "compression ratio ${RATIO}x (want >= 2x)"; fi
 
 # The frame the client decoded must be real content, not a blank buffer.
 FRAME="tmp/client-frame.out$OID.ppm"

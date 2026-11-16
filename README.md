@@ -78,8 +78,15 @@ swaymsg exec foot
 Server → client, `MSG_FRAME = 1`:
 
 ```
-u8 type | u16 output_id | u32 width | u32 height | u32 stride | u32 payload_len | BGRA bytes
+u8 type | u16 output_id | u32 width | u32 height | u32 stride | u8 flags | u32 payload_len | payload
 ```
+
+`flags` bit0 (`FRAME_FLAG_ZLIB`) means the payload is a zlib stream that inflates to
+`stride*height` bytes of BGRA rows; with bit0 clear the payload is those rows raw.
+The bridge deflates every frame (zlib level 1) and falls back to raw when that would
+not shrink it; `vrdesk-bridge --raw` disables compression entirely. A mostly-static
+desktop compresses ~100-170x (a 1280x720 frame goes from 3.7 MB to tens of KB), so
+the LAN/Wi-Fi bandwidth problem below is largely gone.
 
 Client → server:
 
@@ -88,6 +95,25 @@ MSG_POINTER = 2: u16 output_id | f32 x | f32 y (normalised 0..1) | u8 buttons | 
 MSG_SCROLL  = 4: u16 output_id | f32 dx | f32 dy
 action: 0 = move, 1 = press, 2 = release
 ```
+
+## Roadmap — toward a full Virtual Desktop clone
+
+Virtual Desktop streams a real Windows desktop into the headset with low-latency
+video, full input (mouse, keyboard, scroll), multi-monitor, and audio. This repo
+is the Linux/Quest equivalent; the table tracks how far each piece has got.
+
+| Feature | State | Where |
+| --- | --- | --- |
+| Headless multi-monitor compositor | done | `bin/start-sway.sh`, `sway.conf` |
+| Frame streaming to headset over TCP | done | `src/bridge.c` `MSG_FRAME` |
+| Controller ray + trigger → pointer | done | `quest/jni/vrdesk_xr.c`, `MSG_POINTER` |
+| Scroll wheel | done | `MSG_SCROLL` |
+| Per-frame compression (zlib) | done | `MSG_FRAME` flags bit0, `--raw` to disable |
+| Keyboard injection (type into apps) | next | `MSG_KEY` is parsed but ignored (no vkbd seat) |
+| Right/middle mouse buttons | next | only BTN_LEFT (272) is mapped |
+| Audio from desktop to headset | next | not started |
+| H.264/HEVC video (hardware decode) | later | raw BGRA + zlib today |
+| Stream the human's real GNOME session | later | needs portal/PipeWire or root |
 
 ## Known limits
 
@@ -100,5 +126,7 @@ action: 0 = move, 1 = press, 2 = release
   window. Tests therefore assert the *active output*, not keyboard focus.
 - `wl_output.geometry` reports 0,0 for headless outputs, so the bridge reads real output
   rects from sway's IPC (`GET_OUTPUTS`) instead.
-- Frames are raw BGRA over TCP (no compression): ~3.7 MB/frame at 1280x720, ~8.3 MB at
-  1920x1080. Fine on a LAN, not on Wi-Fi far from the router.
+- Frames are zlib-deflated BGRA over TCP (see wire format). Uncompressed they are ~3.7 MB
+  at 1280x720 and ~8.3 MB at 1920x1080; zlib level 1 turns a mostly-static desktop into
+  tens of KB, but fast-changing video still costs several MB/s. H.264/HEVC is the real fix
+  and is on the roadmap.

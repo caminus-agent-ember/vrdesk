@@ -6,7 +6,9 @@
  * MSG_POINTER events back to the bridge.
  *
  * Wire format (must match src/bridge.c):
- *   server -> client  MSG_FRAME  = 1: u8 type, u16 oid, u32 w, u32 h, u32 stride, u32 len, BGRA
+ *   server -> client  MSG_FRAME  = 1: u8 type, u16 oid, u32 w, u32 h, u32 stride,
+ *                                  u8 flags, u32 len, payload
+ *                     flags bit0 = payload is zlib-deflated (inflates to stride*h BGRA bytes)
  *   client -> server  MSG_POINTER= 2: u16 oid, f32 x, f32 y (normalised), u8 buttons, u8 action
  *                     MSG_SCROLL = 4: u16 oid, f32 dx, f32 dy
  *   action: 0 = move, 1 = press, 2 = release
@@ -41,6 +43,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -60,6 +63,7 @@
 #define MSG_POINTER 2
 #define MSG_KEY     3
 #define MSG_SCROLL  4
+#define FRAME_FLAG_ZLIB 0x01
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) {
@@ -91,6 +95,7 @@ static char g_host[128] = DEFAULT_HOST;
 static int  g_port = DEFAULT_PORT;
 static volatile int g_net_running = 0;
 static volatile int g_connected = 0;
+static volatile int g_bad_frames = 0;   /* frames that failed to inflate */
 static volatile int g_quit = 0;
 
 /* outbound queue: controller events produced by the render thread */
@@ -199,12 +204,11 @@ static void *net_thread(void *arg) {
                 if (send_all(fd, tmp, len) != 0) goto drop;
             }
             /* then one frame header (blocking, but the bridge streams at ~30 fps).
-               The bridge writes type(1) + oid(2) + w(4) + h(4) + stride(4) + len(4)
-               = 19 bytes. Reading only 17 left 2 bytes of every header in the
-               stream, so each subsequent header was parsed 2 bytes off and the
-               length field came out as garbage (e.g. 475136 instead of 3686400),
-               which failed the sanity check and dropped the connection. */
-            if (recv_all(fd, hdr, 19) != 0) goto drop;
+               The bridge writes type(1) + oid(2) + w(4) + h(4) + stride(4) + flags(1)
+               + len(4) = 23 bytes. Reading only 17 (an earlier bug) left 2 bytes of
+               every header in the stream, so each subsequent header was parsed 2 bytes
+               off and the length field came out as garbage. */
+            if (recv_all(fd, hdr, 23) != 0) goto drop;
             if (hdr[0] != MSG_FRAME) {
                 LOGE("unexpected message type %u", hdr[0]);
                 goto drop;
@@ -213,28 +217,56 @@ static void *net_thread(void *arg) {
             uint32_t w      = rd32(hdr + 3);
             uint32_t h      = rd32(hdr + 7);
             uint32_t stride = rd32(hdr + 11);
-            uint32_t len    = rd32(hdr + 15);
-            if (w == 0 || h == 0 || stride < w * 4 || len < stride * h || len > (64u << 20)) {
-                LOGE("bad frame oid=%u %ux%u stride=%u len=%u", oid, w, h, stride, len);
+            uint8_t  flags  = hdr[15];
+            uint32_t len    = rd32(hdr + 16);
+            uint32_t raw    = stride * h;
+            if (w == 0 || h == 0 || stride < w * 4 || len == 0 || len > (64u << 20) ||
+                (!(flags & FRAME_FLAG_ZLIB) && len != raw)) {
+                LOGE("bad frame oid=%u %ux%u stride=%u flags=%u len=%u", oid, w, h, stride, flags, len);
                 goto drop;
             }
             monitor_t *m = mon_for(oid);
             if (!m) { LOGE("too many monitors"); goto drop; }
             pthread_mutex_lock(&g_net_mu);
-            if (m->pending_cap < len) {
-                uint8_t *nb = realloc(m->pending, len);
+            /* always stage a full raw-size buffer: a compressed frame inflates into it */
+            if (m->pending_cap < raw) {
+                uint8_t *nb = realloc(m->pending, raw);
                 if (!nb) {
                     pthread_mutex_unlock(&g_net_mu);
-                    LOGE("oom for frame %u bytes", len);
+                    LOGE("oom for frame %u bytes", raw);
                     goto drop;
                 }
                 m->pending = nb;
-                m->pending_cap = len;
+                m->pending_cap = raw;
             }
             m->w = w;
             m->h = h;
             pthread_mutex_unlock(&g_net_mu);
             if (recv_all(fd, m->pending, (int)len) != 0) goto drop;
+            if (flags & FRAME_FLAG_ZLIB) {
+                /* zlib stream: inflate in place into a scratch buffer, then swap it in.
+                   uLongf is the zlib contract; the frame is at most a few MB. */
+                static uint8_t *zbuf;
+                static size_t zcap;
+                if (zcap < raw) {
+                    uint8_t *nb = realloc(zbuf, raw);
+                    if (!nb) { LOGE("oom for inflate %u bytes", raw); goto drop; }
+                    zbuf = nb; zcap = raw;
+                }
+                uLongf out = (uLongf)raw;
+                int zr = uncompress(zbuf, &out, m->pending, (uLong)len);
+                if (zr != Z_OK || out != (uLongf)raw) {
+                    LOGE("inflate failed zr=%d out=%lu want=%u", zr, (unsigned long)out, raw);
+                    g_bad_frames++;
+                    goto drop;
+                }
+                pthread_mutex_lock(&g_net_mu);
+                uint8_t *tmp = m->pending;
+                m->pending = zbuf;
+                m->pending_cap = raw;
+                zbuf = tmp; zcap = raw;
+                pthread_mutex_unlock(&g_net_mu);
+            }
             pthread_mutex_lock(&g_net_mu);
             m->dirty = 1;
             pthread_mutex_unlock(&g_net_mu);

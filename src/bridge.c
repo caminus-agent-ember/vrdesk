@@ -43,10 +43,12 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
+#include <zlib.h>
 #include "wlr-screencopy-unstable-v1-client.h"
 #include "wlr-virtual-pointer-unstable-v1-client.h"
 
 #define MAX_OUTPUTS 8
+#define FRAME_FLAG_ZLIB 0x01  // payload is zlib-deflated; 0 = raw BGRA rows
 #define MSG_FRAME 1
 #define MSG_POINTER 2
 #define MSG_KEY 3
@@ -66,6 +68,8 @@ struct output {
     struct wl_buffer *buffer;
     struct wl_shm_pool *pool;
     int shm_fd;
+    uint8_t *zbuf;      // zlib scratch for the outgoing frame
+    size_t zcap;
 };
 
 static struct wl_display *display;
@@ -78,6 +82,9 @@ static struct zwlr_virtual_pointer_v1 *vpointer;
 static struct output outputs[MAX_OUTPUTS];
 static int n_outputs = 0;
 static long stat_captures = 0, stat_ready = 0, stat_failed = 0, stat_sent = 0;
+static long stat_zframes = 0, stat_rawframes = 0, stat_zfail = 0;
+static unsigned long long stat_bytes_raw = 0, stat_bytes_wire = 0;
+static int raw_mode = 0;    // --raw: send uncompressed frames
 static int running = 1;
 static int client_fd = -1;
 static int listen_fd = -1;
@@ -108,6 +115,7 @@ static void output_free_buffer(struct output *o) {
     if (o->pool) { wl_shm_pool_destroy(o->pool); o->pool = NULL; }
     if (o->shm_data) { munmap(o->shm_data, o->shm_size); o->shm_data = NULL; }
     if (o->shm_fd >= 0) { close(o->shm_fd); o->shm_fd = -1; }
+    free(o->zbuf); o->zbuf = NULL; o->zcap = 0;
 }
 
 static void frame_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
@@ -321,18 +329,49 @@ static int write_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
+// zlib-deflate one captured frame. Returns the compressed length, or 0 when
+// compression is off or did not help (caller then sends raw rows).
+static uint32_t compress_frame(struct output *o, uint8_t **out) {
+    if (raw_mode) return 0;
+    uLongf cap = compressBound((uLong)o->shm_size);
+    if (cap > o->zcap) {
+        uint8_t *nb = realloc(o->zbuf, cap);
+        if (!nb) return 0;
+        o->zbuf = nb; o->zcap = cap;
+    }
+    uLongf zlen = cap;
+    if (compress2(o->zbuf, &zlen, o->shm_data, (uLong)o->shm_size, 1) != Z_OK) {
+        stat_zfail++;
+        return 0;
+    }
+    if (zlen >= o->shm_size) return 0;   // incompressible: raw is cheaper
+    *out = o->zbuf;
+    return (uint32_t)zlen;
+}
+
 static int send_frame(struct output *o) {
     if (client_fd < 0 || !o->ready || !o->shm_data) return -1;
     uint8_t type = MSG_FRAME;
     uint16_t oid = (uint16_t)o->id;
     uint32_t w = (uint32_t)o->width, h = (uint32_t)o->height, s = (uint32_t)o->stride;
-    uint32_t plen = s * h;
+    uint32_t rawlen = (uint32_t)o->shm_size;
+    uint8_t *payload = o->shm_data;
+    uint32_t plen = compress_frame(o, &payload);
+    uint8_t flags = 0;
+    if (plen) {
+        flags = FRAME_FLAG_ZLIB;
+    } else {
+        plen = rawlen;
+    }
     if (write_all(client_fd, &type, 1) || write_all(client_fd, &oid, 2) ||
         write_all(client_fd, &w, 4) || write_all(client_fd, &h, 4) ||
-        write_all(client_fd, &s, 4) || write_all(client_fd, &plen, 4) ||
-        write_all(client_fd, o->shm_data, plen)) {
+        write_all(client_fd, &s, 4) || write_all(client_fd, &flags, 1) ||
+        write_all(client_fd, &plen, 4) || write_all(client_fd, payload, plen)) {
         return -1;
     }
+    stat_bytes_raw += rawlen;
+    stat_bytes_wire += plen;
+    if (flags) stat_zframes++; else stat_rawframes++;
     o->ready = 0;
     return 0;
 }
@@ -438,7 +477,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) target_fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
-        else { fprintf(stderr, "usage: %s [--port N] [--fps N] [-v]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--raw")) raw_mode = 1;
+        else { fprintf(stderr, "usage: %s [--port N] [--fps N] [--raw] [-v]\n", argv[0]); return 2; }
     }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -519,8 +559,10 @@ int main(int argc, char **argv) {
         double t = now_sec();
         if (verbose && t >= next_stats) {
             next_stats = t + 2.0;
-            logmsg("stats: captures=%ld ready=%ld failed=%ld sent=%ld client=%d",
-                   stat_captures, stat_ready, stat_failed, stat_sent, client_fd >= 0);
+            logmsg("stats: captures=%ld ready=%ld failed=%ld sent=%ld client=%d zlib=%ld raw=%ld zfail=%ld ratio=%.1fx",
+                   stat_captures, stat_ready, stat_failed, stat_sent, client_fd >= 0,
+                   stat_zframes, stat_rawframes, stat_zfail,
+                   stat_bytes_wire ? (double)stat_bytes_raw / (double)stat_bytes_wire : 0.0);
         }
         if (t >= next_frame) {
             next_frame = t + frame_interval;

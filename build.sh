@@ -9,5 +9,5 @@ gcc -O2 -Wall -Wextra -Wno-unused-parameter \
     "$HERE/proto/wlr-screencopy-unstable-v1-protocol.c" \
     "$HERE/proto/wlr-virtual-pointer-unstable-v1-protocol.c" \
     -I"$HERE/proto" \
-    $(pkg-config --cflags --libs wayland-client) -lm
+    $(pkg-config --cflags --libs wayland-client) -lz -lm
 echo "built $HERE/bin/vrdesk-bridge"
