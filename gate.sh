@@ -15,10 +15,19 @@ echo "$M" | grep -q 'android.app.lib_name'                  && ok "lib_name meta
 echo "$M" | grep -q 'com.oculus.intent.category.VR'         && ok "VR category"         || bad "no VR category"
 
 echo "== 2. bridge up"
-if ! ss -ltn | grep -q ':5000'; then
-  nohup bin/start-bridge.sh > logs/bridge-restart.out 2>&1 &
-  for _ in $(seq 1 40); do ss -ltn | grep -q ':5000' && break; sleep 0.25; done
-fi
+# A previous run's bridge (or a half-dead one still holding the port) makes the new
+# instance die with "bind 5000: Address already in use", which then looks like
+# "bridge did not start" in step 4. Kill any existing bridge and WAIT for the port
+# to be free before starting a fresh one.
+pkill -f 'bin/vrdesk-bridge' 2>/dev/null
+for _ in $(seq 1 40); do
+  ss -ltn | grep -q ':5000' || break
+  sleep 0.25
+done
+pkill -9 -f 'bin/vrdesk-bridge' 2>/dev/null
+rm -f logs/bridge.log
+nohup bin/start-bridge.sh > logs/bridge-restart.out 2>&1 &
+for _ in $(seq 1 60); do ss -ltn | grep -q ':5000' && break; sleep 0.25; done
 ss -ltn | grep -q ':5000' && ok "bridge listening on :5000" || bad "bridge not listening"
 
 echo "== 3. fresh launch"

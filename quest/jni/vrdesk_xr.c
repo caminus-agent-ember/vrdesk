@@ -253,10 +253,23 @@ static void *net_thread(void *arg) {
                     if (!nb) { LOGE("oom for inflate %u bytes", raw); goto drop; }
                     zbuf = nb; zcap = raw;
                 }
-                uLongf out = (uLongf)raw;
-                int zr = uncompress(zbuf, &out, m->pending, (uLong)len);
-                if (zr != Z_OK || out != (uLongf)raw) {
-                    LOGE("inflate failed zr=%d out=%lu want=%u", zr, (unsigned long)out, raw);
+                /* Use the streaming API, not uncompress(): Android's NDK stub libz.so
+                   does not export uncompress(), so linking against it made dlopen fail
+                   with "cannot locate symbol uncompress" and the app died at launch. */
+                z_stream zs;
+                memset(&zs, 0, sizeof zs);
+                zs.next_in = m->pending;
+                zs.avail_in = len;
+                zs.next_out = zbuf;
+                zs.avail_out = raw;
+                int zr = inflateInit(&zs);
+                if (zr == Z_OK) {
+                    zr = inflate(&zs, Z_FINISH);
+                    inflateEnd(&zs);
+                }
+                if (zr != Z_STREAM_END || zs.total_out != raw) {
+                    LOGE("inflate failed zr=%d out=%lu want=%u", zr,
+                         (unsigned long)zs.total_out, raw);
                     g_bad_frames++;
                     goto drop;
                 }
