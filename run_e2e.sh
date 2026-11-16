@@ -23,6 +23,16 @@ cd "$HERE" || exit 1
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
 export SWAYSOCK="${SWAYSOCK:-$XDG_RUNTIME_DIR/sway-ipc.$(id -u).vrdesk.sock}"
 PORT="${PORT:-5000}"
+# Never fight another bridge for the port: the human may be running their own copy
+# (e.g. /home/ignis/src/vrdesk/bin/vrdesk-bridge on :5000), which we must not kill.
+# If the wanted port is taken, walk up until one is free and use that.
+if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+  for p in $(seq $((PORT + 1)) $((PORT + 99))); do
+    if ! ss -ltn 2>/dev/null | grep -q ":$p "; then PORT=$p; break; fi
+  done
+  echo "port $((PORT - 1)) was busy; using :$PORT for this run"
+fi
+export PORT
 mkdir -p logs run tmp
 
 FAIL=0
